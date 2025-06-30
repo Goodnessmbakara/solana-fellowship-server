@@ -1,7 +1,7 @@
 use axum::{
-    extract::State,
+    extract::{rejection::JsonRejection, State},
     http::StatusCode,
-    response::Json,
+    response::{IntoResponse, Json},
     routing::{get, post},
     Router,
 };
@@ -78,11 +78,12 @@ struct InstructionResponse {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MintTokenRequest {
     mint: String,
     destination: String,
     authority: String,
-    amount: u64,
+    amount: i64, // allow negative for validation
 }
 
 #[derive(Deserialize)]
@@ -148,22 +149,28 @@ struct SendTokenResponse {
     instruction_data: String,
 }
 
-// Helper function to create error response
-fn error_response<T>(error: &str) -> Json<ApiResponse<T>> {
-    Json(ApiResponse {
-        success: false,
-        data: None,
-        error: Some(error.to_string()),
-    })
+// Helper function to create error response with HTTP 400
+fn error_response<T>(error: &str) -> (StatusCode, Json<ApiResponse<T>>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ApiResponse::<T> {
+            success: false,
+            data: None,
+            error: Some(error.to_string()),
+        })
+    )
 }
 
-// Helper function to create success response
-fn success_response<T>(data: T) -> Json<ApiResponse<T>> {
-    Json(ApiResponse {
-        success: true,
-        data: Some(data),
-        error: None,
-    })
+// Helper function to create success response with HTTP 200
+fn success_response<T>(data: T) -> (StatusCode, Json<ApiResponse<T>>) {
+    (
+        StatusCode::OK,
+        Json(ApiResponse::<T> {
+            success: true,
+            data: Some(data),
+            error: None,
+        })
+    )
 }
 
 // Helper to parse pubkey with better error handling
@@ -183,8 +190,23 @@ fn validate_amount(amount: u64, field_name: &str) -> Result<(), ServerError> {
     Ok(())
 }
 
+// Global error handler for JSON parsing/deserialization errors
+async fn json_error_handler(err: JsonRejection) -> impl IntoResponse {
+    let msg = match &err {
+        JsonRejection::MissingJsonContentType(_) => "Missing or invalid Content-Type: application/json".to_string(),
+        JsonRejection::JsonDataError(e) => format!("Invalid JSON data: {}", e.body_text()),
+        JsonRejection::JsonSyntaxError(e) => format!("Malformed JSON: {}", e.body_text()),
+        _ => format!("Invalid request: {}", err),
+    };
+    let body = serde_json::json!({
+        "success": false,
+        "error": msg
+    });
+    (StatusCode::BAD_REQUEST, axum::response::Json(body))
+}
+
 // 1. Generate Keypair endpoint
-async fn generate_keypair() -> Json<ApiResponse<KeypairResponse>> {
+async fn generate_keypair() -> (StatusCode, Json<ApiResponse<KeypairResponse>>) {
     // Generate a new keypair - this is pretty straightforward
     let keypair = Keypair::new();
     let pubkey = keypair.pubkey();
@@ -202,7 +224,7 @@ async fn generate_keypair() -> Json<ApiResponse<KeypairResponse>> {
 // 2. Create Token endpoint
 async fn create_token(
     Json(request): Json<CreateTokenRequest>,
-) -> Json<ApiResponse<InstructionResponse>> {
+) -> (StatusCode, Json<ApiResponse<InstructionResponse>>) {
     // Validate inputs
     let mint_authority = match parse_pubkey(&request.mint_authority) {
         Ok(pk) => pk,
@@ -252,28 +274,28 @@ async fn create_token(
 // 3. Mint Token endpoint
 async fn mint_token(
     Json(request): Json<MintTokenRequest>,
-) -> Json<ApiResponse<InstructionResponse>> {
+) -> (StatusCode, Json<ApiResponse<InstructionResponse>>) {
     // Parse and validate all pubkeys
     let mint = match parse_pubkey(&request.mint) {
         Ok(pk) => pk,
         Err(e) => return error_response(&e.to_string()),
     };
-    
     let destination = match parse_pubkey(&request.destination) {
         Ok(pk) => pk,
         Err(e) => return error_response(&e.to_string()),
     };
-    
     let authority = match parse_pubkey(&request.authority) {
         Ok(pk) => pk,
         Err(e) => return error_response(&e.to_string()),
     };
-    
     // Validate amount
-    if let Err(e) = validate_amount(request.amount, "amount") {
-        return error_response(&e.to_string());
+    if request.amount <= 0 {
+        return error_response("Invalid amount: amount must be greater than 0");
     }
-    
+    if request.amount > 1_000_000_000_000_000_000 {
+        return error_response("Invalid amount: amount too large");
+    }
+    let amount = request.amount as u64;
     // Create mint_to instruction
     let instruction = match token_instruction::mint_to(
         &spl_token::id(),
@@ -281,12 +303,11 @@ async fn mint_token(
         &destination,
         &authority,
         &[],
-        request.amount,
+        amount,
     ) {
         Ok(inst) => inst,
         Err(_) => return error_response("Failed to create mint_to instruction"),
     };
-    
     // Convert to response format
     let accounts = instruction
         .accounts
@@ -297,7 +318,6 @@ async fn mint_token(
             is_writable: meta.is_writable,
         })
         .collect();
-    
     success_response(InstructionResponse {
         program_id: instruction.program_id.to_string(),
         accounts,
@@ -305,10 +325,18 @@ async fn mint_token(
     })
 }
 
+// Wrapper for /token/mint to catch JSON extraction errors
+async fn mint_token_wrapper(payload: Result<axum::extract::Json<MintTokenRequest>, axum::extract::rejection::JsonRejection>) -> axum::response::Response {
+    match payload {
+        Ok(json) => mint_token(json).await.into_response(),
+        Err(err) => json_error_handler(err).await.into_response(),
+    }
+}
+
 // 4. Sign Message endpoint
 async fn sign_message(
     Json(request): Json<SignMessageRequest>,
-) -> Json<ApiResponse<SignMessageResponse>> {
+) -> (StatusCode, Json<ApiResponse<SignMessageResponse>>) {
     // Validate inputs
     if request.message.is_empty() {
         return error_response("Message cannot be empty");
@@ -348,7 +376,7 @@ async fn sign_message(
 // 5. Verify Message endpoint
 async fn verify_message(
     Json(request): Json<VerifyMessageRequest>,
-) -> Json<ApiResponse<VerifyMessageResponse>> {
+) -> (StatusCode, Json<ApiResponse<VerifyMessageResponse>>) {
     // Parse pubkey
     let pubkey = match parse_pubkey(&request.pubkey) {
         Ok(pk) => pk,
@@ -391,7 +419,7 @@ async fn verify_message(
 // 6. Send SOL endpoint
 async fn send_sol(
     Json(request): Json<SendSolRequest>,
-) -> Json<ApiResponse<SendSolResponse>> {
+) -> (StatusCode, Json<ApiResponse<SendSolResponse>>) {
     // Parse pubkeys
     let from = match parse_pubkey(&request.from) {
         Ok(pk) => pk,
@@ -433,7 +461,7 @@ async fn send_sol(
 // 7. Send Token endpoint
 async fn send_token(
     Json(request): Json<SendTokenRequest>,
-) -> Json<ApiResponse<SendTokenResponse>> {
+) -> (StatusCode, Json<ApiResponse<SendTokenResponse>>) {
     // Parse all pubkeys
     let destination = match parse_pubkey(&request.destination) {
         Ok(pk) => pk,
@@ -490,12 +518,12 @@ async fn send_token(
 }
 
 // Health check endpoint
-async fn health_check() -> Json<serde_json::Value> {
-    Json(json!({
+async fn health_check() -> (StatusCode, Json<serde_json::Value>) {
+    (StatusCode::OK, Json(json!({
         "status": "healthy",
         "timestamp": chrono::Utc::now().to_rfc3339(),
         "service": "Solana Fellowship Server"
-    }))
+    })))
 }
 
 #[tokio::main]
@@ -511,7 +539,7 @@ async fn main() {
         .route("/health", get(health_check))
         .route("/keypair", post(generate_keypair))
         .route("/token/create", post(create_token))
-        .route("/token/mint", post(mint_token))
+        .route("/token/mint", post(mint_token_wrapper))
         .route("/message/sign", post(sign_message))
         .route("/message/verify", post(verify_message))
         .route("/send/sol", post(send_sol))
