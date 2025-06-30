@@ -1,0 +1,31 @@
+[package]
+name = "solana-fellowship-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1.0", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tower-http = { version = "0.5", features = ["cors"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+chrono = { version = "0.4", features = ["serde"] }
+
+# Solana dependencies
+solana-client = "1.17"
+solana-sdk = "1.17"
+solana-program = "1.17"
+spl-token = "4.0"
+spl-associated-token-account = "2.3"
+
+# Crypto and encoding
+bs58 = "0.5"
+base64 = "0.21"
+ed25519-dalek = "1.0"
+signature = "1.6"
+
+# Utilities
+anyhow = "1.0"
+thiserror = "1.0" 
